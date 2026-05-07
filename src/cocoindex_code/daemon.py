@@ -24,6 +24,7 @@ from ._daemon_paths import (
 )
 from ._version import __version__
 from .chunking import ChunkerFn as _ChunkerFn
+from .chunkers.dart import dart_chunker as _dart_chunker
 from .embedder_params import resolve_embedder_params
 from .project import Project
 from .protocol import (
@@ -92,13 +93,19 @@ def _build_backward_compat_warning(
     )
 
 
+_BUILTIN_CHUNKERS: dict[str, _ChunkerFn] = {
+    ".dart": _dart_chunker,
+}
+
+
 def _resolve_chunker_registry(mappings: list[ChunkerMapping]) -> dict[str, _ChunkerFn]:
     """Resolve ``ChunkerMapping`` settings entries to a ``{suffix: fn}`` dict.
 
+    Starts from built-in chunkers; user-configured entries override them.
     Each ``mapping.module`` must be a ``"module.path:callable"`` string importable
     from the current environment.
     """
-    registry: dict[str, _ChunkerFn] = {}
+    registry: dict[str, _ChunkerFn] = dict(_BUILTIN_CHUNKERS)
     for cm in mappings:
         module_path, _, attr = cm.module.partition(":")
         if not attr:

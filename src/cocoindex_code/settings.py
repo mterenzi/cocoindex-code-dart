@@ -49,6 +49,7 @@ DEFAULT_INCLUDED_PATTERNS: list[str] = [
     "**/*.swift",  # Swift
     "**/*.kt",  # Kotlin
     "**/*.kts",  # Kotlin script
+    "**/*.dart",  # Dart
     "**/*.scala",  # Scala
     "**/*.r",  # R
     "**/*.html",  # HTML
