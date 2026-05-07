@@ -127,6 +127,113 @@ def _pos(line: int) -> TextPosition:
     return TextPosition(byte_offset=0, char_offset=0, line=line, column=0)
 
 
+def _find_method_boundaries(lines: list[str]) -> list[int]:
+    """Find line indices where each method/inner block begins inside a class.
+
+    Anchored at the body level (depth 1): when depth drops from >1 back to 1,
+    the next non-empty line is treated as the start of a new method.  The
+    returned list always starts with 0 — the class header (and anything
+    preceding the first method body) is grouped with the first method.
+
+    Returns ``[0]`` if no interior method boundaries are found (e.g. the chunk
+    is a single function with no nested blocks).
+    """
+    parser = _Parser()
+    boundaries = [0]
+    body_started = False
+
+    for i, line in enumerate(lines):
+        prev_depth = parser.depth
+        net, _ = parser.feed(line)
+        parser.depth = max(0, parser.depth + net)
+
+        if not body_started and parser.depth >= 1:
+            body_started = True
+            continue
+
+        if body_started and prev_depth > 1 and parser.depth == 1:
+            j = i + 1
+            while j < len(lines) and not lines[j].strip():
+                j += 1
+            if j < len(lines) and j not in boundaries:
+                tail = "\n".join(lines[j:]).strip()
+                # Avoid emitting a tail chunk that is just the class's closing brace.
+                if tail and tail != "}":
+                    boundaries.append(j)
+
+    return boundaries
+
+
+def _splitter_split(lines: list[str], offset: int) -> list[Chunk]:
+    """Run RecursiveSplitter on the joined lines, returning Chunks anchored
+    at ``offset`` (0-based line index of ``lines[0]`` in the original file).
+    """
+    raw = "\n".join(lines)
+    return [
+        Chunk(
+            text=sub.text,
+            start=_pos(offset + sub.start.line),
+            end=_pos(offset + sub.end.line),
+        )
+        for sub in _splitter.split(
+            raw,
+            chunk_size=_CHUNK_SIZE,
+            min_chunk_size=_MIN_CHUNK_SIZE,
+            chunk_overlap=_CHUNK_OVERLAP,
+            language="dart",
+        )
+        if sub.text.strip()
+    ]
+
+
+def _split_oversized(lines: list[str], offset: int) -> list[Chunk]:
+    """Split an oversized class/block by method boundaries, packing consecutive
+    methods up to ``_CHUNK_SIZE``.  Falls back to ``RecursiveSplitter`` when
+    no method seams are found, and applies it post-hoc to any single packed
+    chunk that's still too large (e.g. a 5000-char method).
+    """
+    boundaries = _find_method_boundaries(lines)
+    if len(boundaries) <= 1:
+        return _splitter_split(lines, offset)
+
+    # Per-method byte sizes (including newlines) for packing decisions.
+    sizes: list[int] = []
+    for k, start in enumerate(boundaries):
+        end = boundaries[k + 1] if k + 1 < len(boundaries) else len(lines)
+        sizes.append(sum(len(lines[m]) + 1 for m in range(start, end)))
+
+    # Greedily pack adjacent methods up to _CHUNK_SIZE.
+    packed: list[Chunk] = []
+    pack_start = 0
+    pack_size = 0
+    for idx in range(len(boundaries)):
+        if pack_size > 0 and pack_size + sizes[idx] > _CHUNK_SIZE:
+            start = boundaries[pack_start]
+            end = boundaries[idx]
+            text = "\n".join(lines[start:end]).strip()
+            if text:
+                packed.append(Chunk(text=text, start=_pos(offset + start + 1), end=_pos(offset + end)))
+            pack_start = idx
+            pack_size = sizes[idx]
+        else:
+            pack_size += sizes[idx]
+
+    start = boundaries[pack_start]
+    text = "\n".join(lines[start:]).strip()
+    if text:
+        packed.append(Chunk(text=text, start=_pos(offset + start + 1), end=_pos(offset + len(lines))))
+
+    # Post-pass: any chunk still too large (a single huge method) gets the splitter.
+    final: list[Chunk] = []
+    for c in packed:
+        if len(c.text) > _MAX_CHUNK_CHARS:
+            sub_offset = c.start.line - 1
+            final.extend(_splitter_split(c.text.splitlines(), sub_offset))
+        else:
+            final.append(c)
+    return final
+
+
 def dart_chunker(_path: Path, content: str) -> tuple[str | None, list[Chunk]]:
     """Split Dart source at top-level class/function boundaries.
 
@@ -136,8 +243,10 @@ def dart_chunker(_path: Path, content: str) -> tuple[str | None, list[Chunk]]:
       appears in code context, and the line begins with a type-declaration
       keyword (``class``, ``enum``, ``mixin``, etc.).
 
-    Chunks exceeding ``_MAX_CHUNK_CHARS`` are split further by a
-    ``RecursiveSplitter`` fallback so they stay within embedding-model limits.
+    Chunks exceeding ``_MAX_CHUNK_CHARS`` are recursively split at method
+    boundaries (depth-2→1 seams inside the class body) and packed up to
+    ``_CHUNK_SIZE``, with a ``RecursiveSplitter`` fallback for blocks with
+    no internal method boundaries.
     """
     lines = content.splitlines()
     if not lines:
@@ -175,21 +284,7 @@ def dart_chunker(_path: Path, content: str) -> tuple[str | None, list[Chunk]]:
             continue
 
         if len(text) > _MAX_CHUNK_CHARS:
-            for sub in _splitter.split(
-                "\n".join(lines[start:end]),
-                chunk_size=_CHUNK_SIZE,
-                min_chunk_size=_MIN_CHUNK_SIZE,
-                chunk_overlap=_CHUNK_OVERLAP,
-                language="dart",
-            ):
-                if sub.text.strip():
-                    chunks.append(
-                        Chunk(
-                            text=sub.text,
-                            start=_pos(start + sub.start.line),
-                            end=_pos(start + sub.end.line),
-                        )
-                    )
+            chunks.extend(_split_oversized(lines[start:end], start))
         else:
             chunks.append(Chunk(text=text, start=_pos(start + 1), end=_pos(end)))
 

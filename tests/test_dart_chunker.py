@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from cocoindex_code.chunkers.dart import _MAX_CHUNK_CHARS, _Parser, dart_chunker
+from cocoindex_code.chunkers.dart import (
+    _CHUNK_SIZE,
+    _MAX_CHUNK_CHARS,
+    _Parser,
+    _find_method_boundaries,
+    dart_chunker,
+)
 
 _PATH = Path("test.dart")
 
@@ -305,3 +311,107 @@ def test_small_class_is_not_split() -> None:
     assert len(src) < _MAX_CHUNK_CHARS
     _, chunks = dart_chunker(_PATH, src)
     assert len(chunks) == 1
+
+
+# ---------------------------------------------------------------------------
+# Method-level recursive splitting (oversized class bodies)
+# ---------------------------------------------------------------------------
+
+
+def test_find_method_boundaries_simple() -> None:
+    lines = [
+        "class Foo {",       # 0 — class header
+        "  void m1() {",     # 1
+        "    return;",       # 2
+        "  }",               # 3 — depth 2→1, next non-blank is line 4
+        "  void m2() {",     # 4
+        "    return;",       # 5
+        "  }",               # 6 — next is `}` (line 7), so no boundary
+        "}",                 # 7
+    ]
+    boundaries = _find_method_boundaries(lines)
+    assert boundaries == [0, 4]
+
+
+def test_find_method_boundaries_no_methods() -> None:
+    # Top-level function with no nested blocks → no interior boundaries.
+    lines = [
+        "Future<void> processData() async {",
+        "  await fetch();",
+        "  return;",
+        "}",
+    ]
+    assert _find_method_boundaries(lines) == [0]
+
+
+def test_large_class_splits_at_method_boundaries() -> None:
+    # Build a class large enough to trigger oversized handling.
+    methods = "\n".join(
+        f"  void method{i}() {{\n"
+        f"    final value = {i};\n"
+        f"    print(value);\n"
+        f"  }}"
+        for i in range(40)
+    )
+    src = f"class BigClass {{\n{methods}\n}}\n"
+    assert len(src) > _MAX_CHUNK_CHARS
+
+    _, chunks = dart_chunker(_PATH, src)
+    assert len(chunks) > 1
+
+    # Every method body should appear in some chunk (no method split mid-way).
+    joined = "\n".join(c.text for c in chunks)
+    for i in range(40):
+        assert f"void method{i}()" in joined
+        assert f"final value = {i};" in joined
+
+    # Every chunk should contain at least one complete method (starts with `void method` somewhere).
+    assert all("void method" in c.text for c in chunks)
+
+
+def test_large_class_packs_methods_to_chunk_size() -> None:
+    # Methods small enough that several should pack into each chunk.
+    methods = "\n".join(
+        f"  void m{i}() {{ print({i}); }}"  # ~30 chars each
+        for i in range(80)
+    )
+    src = f"class Packed {{\n{methods}\n}}\n"
+    assert len(src) > _MAX_CHUNK_CHARS
+
+    _, chunks = dart_chunker(_PATH, src)
+    # With ~30-char methods and a 1000-char target, expect roughly N/30 ≈ 30+ methods/chunk.
+    # Should produce far fewer chunks than 80.
+    assert len(chunks) < 20
+    assert len(chunks) > 1
+
+
+def test_huge_function_falls_back_to_splitter() -> None:
+    # Single function with no methods, but very large — must fall back to splitter.
+    body_lines = [f"  print('line {i}');" for i in range(200)]
+    src = "void hugeFunction() {\n" + "\n".join(body_lines) + "\n}\n"
+    assert len(src) > _MAX_CHUNK_CHARS
+
+    _, chunks = dart_chunker(_PATH, src)
+    # Should produce multiple chunks via splitter fallback.
+    assert len(chunks) > 1
+
+
+def test_method_boundary_chunks_have_increasing_lines() -> None:
+    methods = "\n".join(
+        f"  void method{i}() {{\n    final value = {i};\n    print(value);\n  }}"
+        for i in range(40)
+    )
+    src = f"class BigClass {{\n{methods}\n}}\n"
+    _, chunks = dart_chunker(_PATH, src)
+
+    # Line numbers should be strictly increasing across chunks.
+    starts = [c.start.line for c in chunks]
+    assert starts == sorted(starts)
+    # And no two chunks share a starting line.
+    assert len(set(starts)) == len(starts)
+
+
+def test_chunk_size_constant_is_used_for_packing() -> None:
+    # Sanity: _CHUNK_SIZE is the packing target. This test just pins it
+    # so a future change to the constant trips a clear failure.
+    assert _CHUNK_SIZE == 1000
