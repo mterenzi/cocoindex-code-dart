@@ -203,6 +203,47 @@ def test_session_happy_path(e2e_project: Path) -> None:
     assert "Daemon version:" in result.output
 
 
+def test_session_hybrid_search_fts_sidecar(e2e_project: Path) -> None:
+    """After indexing, the FTS5 sidecar mirrors vec0 and survives literal-token queries.
+
+    Covers the hybrid search path: vec0 KNN + FTS5 BM25 fused via RRF. The
+    interesting cases are (1) FTS5 table is created and populated, (2) a
+    literal identifier query that vector search ranks poorly still surfaces
+    the chunk containing the literal token, (3) FTS5 syntax characters in
+    user input don't crash the query.
+    """
+    runner.invoke(app, ["init"], catch_exceptions=False)
+    result = runner.invoke(app, ["index"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+
+    db_path = e2e_project / ".cocoindex_code" / "target_sqlite.db"
+    conn = coco_sqlite.connect(str(db_path), load_vec=True)
+    try:
+        with conn.readonly() as db:
+            vec_count = db.execute("SELECT COUNT(*) FROM code_chunks_vec").fetchone()[0]
+            fts_count = db.execute("SELECT COUNT(*) FROM code_chunks_fts").fetchone()[0]
+            fts_hit = db.execute(
+                "SELECT file_path FROM code_chunks_fts "
+                "WHERE code_chunks_fts MATCH ? LIMIT 1",
+                ('"parse_csv_line"',),
+            ).fetchone()
+    finally:
+        conn.close()
+
+    assert vec_count > 0
+    assert fts_count == vec_count, "FTS5 sidecar must mirror vec0 row count"
+    assert fts_hit is not None and fts_hit[0] == "utils.py"
+
+    # Literal-identifier search should reach the defining file via the FTS5 leg.
+    result = runner.invoke(app, ["search", "parse_csv_line"], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert "utils.py" in result.output
+
+    # FTS5 syntax characters in user input must not crash the query.
+    result = runner.invoke(app, ["search", 'parse "csv" line'], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+
+
 def test_session_incremental_index(e2e_project: Path) -> None:
     """Init → index → add new file → re-index → search finds new content."""
     runner.invoke(app, ["init"], catch_exceptions=False)

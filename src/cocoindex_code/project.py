@@ -108,9 +108,44 @@ class Project:
                     if on_progress is not None:
                         on_progress(progress)
                     await asyncio.sleep(0.1)
+            self._rebuild_fts_index()
         finally:
             self._initial_index_done.set()
             self._indexing_stats = None
+
+    def _rebuild_fts_index(self) -> None:
+        """Refresh the FTS5 keyword index from the canonical vec0 table.
+
+        Run after each indexing pass so BM25 keyword search stays aligned with
+        the current chunk set. AFTER triggers on vec0 virtual tables are not
+        reliable across SQLite versions, so we full-rebuild instead — cheap at
+        this scale and it eliminates drift.
+        """
+        db = self._env.get_context(SQLITE_DB)
+        with db.transaction() as conn:
+            conn.execute(
+                """
+                CREATE VIRTUAL TABLE IF NOT EXISTS code_chunks_fts USING fts5(
+                    content,
+                    file_path UNINDEXED,
+                    language UNINDEXED,
+                    start_line UNINDEXED,
+                    end_line UNINDEXED,
+                    tokenize='unicode61 remove_diacritics 0',
+                    prefix='2 3 4'
+                )
+                """
+            )
+            conn.execute("DELETE FROM code_chunks_fts")
+            conn.execute(
+                """
+                INSERT INTO code_chunks_fts(
+                    rowid, content, file_path, language, start_line, end_line
+                )
+                SELECT id, content, file_path, language, start_line, end_line
+                FROM code_chunks_vec
+                """
+            )
 
     async def ensure_indexing_started(self) -> None:
         """Kick off background indexing and wait until it has actually started.

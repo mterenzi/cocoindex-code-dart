@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import heapq
 import sqlite3
 from pathlib import Path
 from typing import Any
@@ -10,23 +9,57 @@ from typing import Any
 from .schema import QueryResult
 from .shared import EMBEDDER, QUERY_EMBED_PARAMS, SQLITE_DB
 
+# Reciprocal Rank Fusion constant. 60 is the value used in the original RRF
+# paper (Cormack et al., 2009) and the de-facto default in code/doc search;
+# higher values flatten differences between top ranks, lower values sharpen
+# them.
+_RRF_K = 60
 
-def _l2_to_score(distance: float) -> float:
-    """Convert L2 distance to cosine similarity (exact for unit vectors)."""
-    return 1.0 - distance * distance / 2.0
+
+def _build_filter_clause(
+    languages: list[str] | None,
+    paths: list[str] | None,
+) -> tuple[str, list[Any]]:
+    """Build a SQL WHERE-clause fragment + params for language/path filters.
+
+    Returns the fragment without the leading ``AND`` so callers can splice it
+    after their own predicate (e.g. ``WHERE foo MATCH ? <fragment>``).
+    """
+    conditions: list[str] = []
+    params: list[Any] = []
+    if languages:
+        placeholders = ",".join("?" for _ in languages)
+        conditions.append(f"language IN ({placeholders})")
+        params.extend(languages)
+    if paths:
+        path_clauses = " OR ".join("file_path GLOB ?" for _ in paths)
+        conditions.append(f"({path_clauses})")
+        params.extend(paths)
+    fragment = (" AND " + " AND ".join(conditions)) if conditions else ""
+    return fragment, params
 
 
 def _knn_query(
     conn: sqlite3.Connection,
     embedding_bytes: bytes,
     k: int,
-    language: str | None = None,
+    languages: list[str] | None = None,
+    paths: list[str] | None = None,
 ) -> list[tuple[Any, ...]]:
-    """Run a vec0 KNN query, optionally constrained to a language partition."""
+    """Run a vec0 KNN query, optionally constrained by language/path.
+
+    When the only filter is a single language we use the vec0 partition key
+    for an indexed search. Anything else falls through to a full scan with
+    ``vec_distance_L2`` so we can apply arbitrary WHERE filters.
+    """
+    if paths or (languages and len(languages) > 1):
+        return _full_scan_query(conn, embedding_bytes, k, 0, languages, paths)
+
+    language = languages[0] if languages else None
     if language is not None:
         return conn.execute(
             """
-            SELECT file_path, language, content, start_line, end_line, distance
+            SELECT id, file_path, language, content, start_line, end_line, distance
             FROM code_chunks_vec
             WHERE embedding MATCH ? AND k = ? AND language = ?
             ORDER BY distance
@@ -35,7 +68,7 @@ def _knn_query(
         ).fetchall()
     return conn.execute(
         """
-        SELECT file_path, language, content, start_line, end_line, distance
+        SELECT id, file_path, language, content, start_line, end_line, distance
         FROM code_chunks_vec
         WHERE embedding MATCH ? AND k = ?
         ORDER BY distance
@@ -53,25 +86,13 @@ def _full_scan_query(
     paths: list[str] | None = None,
 ) -> list[tuple[Any, ...]]:
     """Full scan with SQL-level distance computation and filtering."""
-    conditions: list[str] = []
-    params: list[Any] = [embedding_bytes]
-
-    if languages:
-        placeholders = ",".join("?" for _ in languages)
-        conditions.append(f"language IN ({placeholders})")
-        params.extend(languages)
-
-    if paths:
-        path_clauses = " OR ".join("file_path GLOB ?" for _ in paths)
-        conditions.append(f"({path_clauses})")
-        params.extend(paths)
-
-    where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-    params.extend([limit, offset])
+    fragment, filter_params = _build_filter_clause(languages, paths)
+    where = f"WHERE 1=1{fragment}" if fragment else ""
+    params: list[Any] = [embedding_bytes, *filter_params, limit, offset]
 
     return conn.execute(
         f"""
-        SELECT file_path, language, content, start_line, end_line,
+        SELECT id, file_path, language, content, start_line, end_line,
                vec_distance_L2(embedding, ?) as distance
         FROM code_chunks_vec
         {where}
@@ -80,6 +101,81 @@ def _full_scan_query(
         """,
         params,
     ).fetchall()
+
+
+def _escape_fts5_query(query: str) -> str:
+    """Wrap a free-text query as an FTS5 phrase, escaping embedded quotes.
+
+    Users type bare identifiers (``CvoFile``) or natural-language phrases. We
+    treat the whole input as a single FTS5 phrase: this avoids leaking FTS5
+    operator syntax (``AND``, ``NEAR``, ``-``, ``*``, parentheses) that would
+    otherwise raise SQLITE_ERROR. A phrase miss simply contributes nothing to
+    RRF — the vector side still ranks the result.
+    """
+    return '"' + query.replace('"', '""') + '"'
+
+
+def _fts_query(
+    conn: sqlite3.Connection,
+    query: str,
+    k: int,
+    languages: list[str] | None = None,
+    paths: list[str] | None = None,
+) -> list[tuple[Any, ...]]:
+    """Run a BM25 keyword query against the FTS5 sidecar, if present.
+
+    Returns an empty list when the FTS5 table doesn't exist yet (project that
+    was indexed before hybrid search shipped) — search degrades to vector-only
+    rather than hard-failing.
+    """
+    fragment, filter_params = _build_filter_clause(languages, paths)
+    fts_query = _escape_fts5_query(query)
+    try:
+        return conn.execute(
+            f"""
+            SELECT rowid AS id, file_path, language, content, start_line, end_line,
+                   bm25(code_chunks_fts) AS rank
+            FROM code_chunks_fts
+            WHERE code_chunks_fts MATCH ?{fragment}
+            ORDER BY rank
+            LIMIT ?
+            """,
+            [fts_query, *filter_params, k],
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []
+
+
+def _rrf_merge(
+    vec_rows: list[tuple[Any, ...]],
+    fts_rows: list[tuple[Any, ...]],
+    limit: int,
+    offset: int,
+) -> list[tuple[tuple[Any, ...], float]]:
+    """Combine vector and FTS rankings via Reciprocal Rank Fusion.
+
+    Both inputs are ordered best-first. Output is ``(row, rrf_score)`` pairs
+    sorted by score descending, sliced to the requested window.
+
+    FTS rows are inserted into the score map first so that when a literal-
+    match chunk ties on score with a vec-only chunk (both at rank 1 in their
+    respective retrievers, scoring exactly ``1/(K+1)``), the keyword match
+    wins the stable-sort tie-break. For identifier-style queries this is
+    almost always what the user wants.
+    """
+    scores: dict[Any, list[Any]] = {}
+    for rank, row in enumerate(fts_rows, start=1):
+        chunk_id = row[0]
+        bucket = scores.setdefault(chunk_id, [row, 0.0])
+        bucket[1] = bucket[1] + 1.0 / (_RRF_K + rank)
+    for rank, row in enumerate(vec_rows, start=1):
+        chunk_id = row[0]
+        bucket = scores.setdefault(chunk_id, [row, 0.0])
+        bucket[1] = bucket[1] + 1.0 / (_RRF_K + rank)
+
+    ranked = sorted(scores.values(), key=lambda item: -item[1])
+    window = ranked[offset : offset + limit]
+    return [(item[0], item[1]) for item in window]
 
 
 async def query_codebase(
@@ -91,12 +187,12 @@ async def query_codebase(
     languages: list[str] | None = None,
     paths: list[str] | None = None,
 ) -> list[QueryResult]:
-    """
-    Perform vector similarity search using vec0 KNN index.
+    """Hybrid search: vec0 KNN + FTS5 BM25, fused with Reciprocal Rank Fusion.
 
-    Uses sqlite-vec's vec0 virtual table for indexed nearest-neighbor search.
-    Language filtering uses vec0 partition keys for exact index-level filtering.
-    Path filtering triggers a full scan with distance computation.
+    Vector search alone ranks short identifier queries poorly (``CvoFile``
+    matches "looks like a Cvo widget" before chunks that literally contain
+    the token). The FTS5 sidecar restores that signal; RRF combines both
+    rankings without needing score normalization.
     """
     if not target_sqlite_db_path.exists():
         raise RuntimeError(
@@ -108,40 +204,27 @@ async def query_codebase(
     embedder = env.get_context(EMBEDDER)
     query_params = env.get_context(QUERY_EMBED_PARAMS)
 
-    # Generate query embedding.
     query_embedding = await embedder.embed(query, **query_params)
-
     embedding_bytes = query_embedding.astype("float32").tobytes()
 
-    with db.readonly() as conn:
-        if paths:
-            rows = _full_scan_query(conn, embedding_bytes, limit, offset, languages, paths)
-        elif not languages or len(languages) == 1:
-            lang = languages[0] if languages else None
-            rows = _knn_query(conn, embedding_bytes, limit + offset, lang)
-        else:
-            fetch_k = limit + offset
-            rows = heapq.nsmallest(
-                fetch_k,
-                (
-                    row
-                    for lang in languages
-                    for row in _knn_query(conn, embedding_bytes, fetch_k, lang)
-                ),
-                key=lambda r: r[5],
-            )
+    # Pull a wider candidate pool from each retriever than the user asked for,
+    # so RRF has room to surface chunks that neither side ranked in the top-N.
+    fetch_k = max(50, (limit + offset) * 5)
 
-    if not paths:
-        rows = rows[offset:]
+    with db.readonly() as conn:
+        vec_rows = _knn_query(conn, embedding_bytes, fetch_k, languages, paths)
+        fts_rows = _fts_query(conn, query, fetch_k, languages, paths)
+
+    merged = _rrf_merge(vec_rows, fts_rows, limit, offset)
 
     return [
         QueryResult(
-            file_path=file_path,
-            language=language,
-            content=content,
-            start_line=start_line,
-            end_line=end_line,
-            score=_l2_to_score(distance),
+            file_path=row[1],
+            language=row[2],
+            content=row[3],
+            start_line=row[4],
+            end_line=row[5],
+            score=score,
         )
-        for file_path, language, content, start_line, end_line, distance in rows
+        for row, score in merged
     ]
